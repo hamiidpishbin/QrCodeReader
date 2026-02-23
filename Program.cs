@@ -1,129 +1,94 @@
 using System.Net.Http.Json;
 using System.Text.Encodings.Web;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using PDFtoImage;
 using SkiaSharp;
 using ZXing;
 using ZXing.SkiaSharp;
 
-if (args.Length == 0)
+var builder = WebApplication.CreateBuilder(args);
+
+builder.Services.AddEndpointsApiExplorer();
+builder.Services.AddSwaggerGen();
+builder.Services.AddHttpClient();
+
+var app = builder.Build();
+
+app.UseSwagger();
+app.UseSwaggerUI();
+
+app.MapPost("/scan", async (IFormFile pdf, IHttpClientFactory httpClientFactory) =>
 {
-    Console.WriteLine("Usage: QrCodeReader <path-to-pdf>");
-    Console.WriteLine("Example: QrCodeReader document.pdf");
-    return 1;
-}
-
-string pdfPath = args[0];
-
-if (!File.Exists(pdfPath))
-{
-    Console.Error.WriteLine($"Error: File not found — {pdfPath}");
-    return 1;
-}
-
-Console.WriteLine($"Scanning: {pdfPath}");
-Console.WriteLine(new string('-', 40));
-
-var reader = new ZXing.SkiaSharp.BarcodeReader
-{
-    Options =
+    // 1. Scan PDF pages for a QR code
+    var qrReader = new ZXing.SkiaSharp.BarcodeReader
     {
-        PossibleFormats = [BarcodeFormat.QR_CODE],
-        TryHarder = true,
-        TryInverted = true,
-    }
-};
+        Options =
+        {
+            PossibleFormats = [BarcodeFormat.QR_CODE],
+            TryHarder = true,
+            TryInverted = true,
+        }
+    };
 
-var results = new List<(int Page, string Content)>();
-int pageIndex = 0;
+    string? qrContent = null;
 
-#pragma warning disable CA1416 // PDFtoImage supports Linux, macOS, Windows — all desktop targets
-using var pdfStream = File.OpenRead(pdfPath);
-foreach (SKBitmap bitmap in Conversion.ToImages(pdfStream))
+#pragma warning disable CA1416
+    using var stream = pdf.OpenReadStream();
+    foreach (SKBitmap bitmap in Conversion.ToImages(stream))
 #pragma warning restore CA1416
-{
-    pageIndex++;
-
-    using (bitmap)
     {
-        Result? qr = reader.Decode(bitmap);
-        if (qr is not null)
+        using (bitmap)
         {
-            results.Add((pageIndex, qr.Text));
-        }
-    }
-}
-
-if (results.Count == 0)
-{
-    Console.WriteLine("No QR codes found in the document.");
-    return 0;
-}
-
-Console.WriteLine($"Found {results.Count} QR code(s):\n");
-
-using var http = new HttpClient();
-
-foreach (var (page, content) in results)
-{
-    Console.WriteLine($"  Page {page}: {content}");
-
-    Guid? guid = ExtractGuid(content);
-    if (guid is null)
-    {
-        Console.WriteLine("  No GUID found in the QR content.\n");
-        continue;
-    }
-
-    Console.WriteLine($"  GUID: {guid}");
-    Console.WriteLine("  Calling policy API...");
-
-    try
-    {
-        var response = await http.PostAsJsonAsync(
-            "https://sanhabinq.centinsur.ir/back/api/CarThirdParty/Policy/Guid",
-            new { guid = guid.ToString() }
-        );
-
-        string json = await response.Content.ReadAsStringAsync();
-
-        // Pretty-print the JSON
-        try
-        {
-            var parsed = JsonSerializer.Deserialize<JsonElement>(json);
-            var jsonOptions = new JsonSerializerOptions
+            var result = qrReader.Decode(bitmap);
+            if (result is not null)
             {
-                WriteIndented = true,
-                Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
-            };
-            json = JsonSerializer.Serialize(parsed, jsonOptions);
+                qrContent = result.Text;
+                break;
+            }
         }
-        catch { /* leave as-is if not valid JSON */ }
-
-        Console.WriteLine($"  Status: {(int)response.StatusCode} {response.StatusCode}");
-        Console.WriteLine($"  Response:\n{json}");
-
-        string outputPath = Path.ChangeExtension(pdfPath, ".json");
-        await File.WriteAllTextAsync(outputPath, json);
-        Console.WriteLine($"  Saved to: {outputPath}");
-    }
-    catch (Exception ex)
-    {
-        Console.Error.WriteLine($"  API call failed: {ex.Message}");
     }
 
-    Console.WriteLine();
-}
+    if (qrContent is null)
+        return Results.BadRequest("No QR code found in the PDF.");
 
-return 0;
-
-static Guid? ExtractGuid(string text)
-{
-    // Match a standard GUID pattern anywhere in the string (e.g. inside a URL)
-    var match = System.Text.RegularExpressions.Regex.Match(
-        text,
+    // 2. Extract GUID from QR content
+    var match = Regex.Match(
+        qrContent,
         @"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
     );
 
-    return match.Success ? Guid.Parse(match.Value) : null;
-}
+    if (!match.Success)
+        return Results.BadRequest($"No GUID found in QR content: {qrContent}");
+
+    var guid = Guid.Parse(match.Value);
+
+    // 3. Call policy API
+    var http = httpClientFactory.CreateClient();
+    var apiResponse = await http.PostAsJsonAsync(
+        "https://sanhabinq.centinsur.ir/back/api/CarThirdParty/Policy/Guid",
+        new { guid = guid.ToString() }
+    );
+
+    var rawJson = await apiResponse.Content.ReadAsStringAsync();
+
+    try
+    {
+        var parsed = JsonSerializer.Deserialize<JsonElement>(rawJson);
+        var prettyJson = JsonSerializer.Serialize(parsed, new JsonSerializerOptions
+        {
+            WriteIndented = true,
+            Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+        });
+        return Results.Content(prettyJson, "application/json");
+    }
+    catch
+    {
+        return Results.Content(rawJson, "application/json");
+    }
+})
+.WithName("ScanPdf")
+.WithSummary("Scan a PDF for a QR code and retrieve the associated policy data")
+.DisableAntiforgery();
+
+app.Run("http://localhost:5001");
