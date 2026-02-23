@@ -1,11 +1,8 @@
-using System.Net.Http.Json;
 using System.Text.Encodings.Web;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using PDFtoImage;
-using SkiaSharp;
 using ZXing;
-using ZXing.SkiaSharp;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -20,7 +17,6 @@ app.UseSwaggerUI();
 
 app.MapPost("/scan", async (IFormFile pdf, IHttpClientFactory httpClientFactory) =>
 {
-    // 1. Scan PDF pages for a QR code
     var qrReader = new ZXing.SkiaSharp.BarcodeReader
     {
         Options =
@@ -33,37 +29,37 @@ app.MapPost("/scan", async (IFormFile pdf, IHttpClientFactory httpClientFactory)
 
     string? qrContent = null;
 
-#pragma warning disable CA1416
-    using var stream = pdf.OpenReadStream();
-    foreach (SKBitmap bitmap in Conversion.ToImages(stream))
-#pragma warning restore CA1416
+    await using var stream = pdf.OpenReadStream();
+    foreach (var bitmap in Conversion.ToImages(stream))
     {
         using (bitmap)
         {
             var result = qrReader.Decode(bitmap);
-            if (result is not null)
-            {
-                qrContent = result.Text;
-                break;
-            }
+            
+            if (result is null) continue;
+            
+            qrContent = result.Text;
+            break;
         }
     }
 
     if (qrContent is null)
+    {
         return Results.BadRequest("No QR code found in the PDF.");
+    }
 
-    // 2. Extract GUID from QR content
     var match = Regex.Match(
         qrContent,
         @"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
     );
 
     if (!match.Success)
+    {
         return Results.BadRequest($"No GUID found in QR content: {qrContent}");
+    }
 
     var guid = Guid.Parse(match.Value);
 
-    // 3. Call policy API
     var http = httpClientFactory.CreateClient();
     var apiResponse = await http.PostAsJsonAsync(
         "https://sanhabinq.centinsur.ir/back/api/CarThirdParty/Policy/Guid",
